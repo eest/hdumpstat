@@ -1,0 +1,801 @@
+#!/usr/bin/env perl
+#
+# Copyright (c) 2014 Patrik Lundin <patrik.lundin.swe@gmail.com>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+#
+
+#
+# A script for parsing information out of a heimdal database dump.
+# See "--help" and "--man" for documentation.
+#
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Getopt::Long;
+use Pod::Usage;
+use Time::Local;
+
+# heimdal/lib/hdb/print.c:
+#/*
+#   This is the present contents of a dump line. This might change at
+#   any time. Fields are separated by white space.
+#
+#  principal
+#  keyblock
+#        kvno
+#        keys...
+#                mkvno
+#                enctype
+#                keyvalue
+#                salt (- means use normal salt)
+#  creation date and principal
+#  modification date and principal
+#  principal valid from date (not used)
+#  principal valid end date (not used)
+#  principal key expires (not used)
+#  max ticket life
+#  max renewable life
+#  flags
+#  generation number
+#  */
+#
+# uid@REALM kvno:mkvno:enctype:keyvalue:3/"salt":mkvno:enctype:keyvalue:3/"salt":[...] createdate:createprincipal modificationdate:modificationprincipal validstart validend passwordend maxlife maxrenevablelife flags gener:ation:number extension1:extension2:extension3
+#
+# See also http://www.h5l.org/manual/HEAD/krb5/krb5_fileformats.html.
+#
+
+my $dump_regex = qr/^(?<princ>\S+\@\S+)\s(?<kvno>\d+):(?<keys>\d+:\d+:\w+:\S+:?)+\s(?<createdate>\d+):(?<createprinc>\S+\@\S+)\s((?<moddate>\d+):(?<modprinc>\S+\@\S+))?-?\s(?<validstart>\S+)\s(?<validend>\S+)\s(?<passwdend>\S+)\s(?<maxlife>\S+)\s(?<maxrenew>\S+)\s(?<flags>\d+)\s(?<gennumber>\d+:\d+:\d+)\s(?<extensions>\S+)$/;
+
+# heimdal/lib/asn1/krb5.asn1:
+# --enctypes
+# ENCTYPE ::= INTEGER {
+#         KRB5_ENCTYPE_NULL(0),
+#         KRB5_ENCTYPE_DES_CBC_CRC(1),
+#         KRB5_ENCTYPE_DES_CBC_MD4(2),
+#         KRB5_ENCTYPE_DES_CBC_MD5(3),
+#         KRB5_ENCTYPE_DES3_CBC_MD5(5),
+#         KRB5_ENCTYPE_OLD_DES3_CBC_SHA1(7),
+#         KRB5_ENCTYPE_SIGN_DSA_GENERATE(8),
+#         KRB5_ENCTYPE_ENCRYPT_RSA_PRIV(9),
+#         KRB5_ENCTYPE_ENCRYPT_RSA_PUB(10),
+#         KRB5_ENCTYPE_DES3_CBC_SHA1(16), -- with key derivation
+#         KRB5_ENCTYPE_AES128_CTS_HMAC_SHA1_96(17),
+#         KRB5_ENCTYPE_AES256_CTS_HMAC_SHA1_96(18),
+#         KRB5_ENCTYPE_ARCFOUR_HMAC_MD5(23),
+#         KRB5_ENCTYPE_ARCFOUR_HMAC_MD5_56(24),
+#         KRB5_ENCTYPE_ENCTYPE_PK_CROSS(48),
+# -- some "old" windows types
+#         KRB5_ENCTYPE_ARCFOUR_MD4(-128),
+#         KRB5_ENCTYPE_ARCFOUR_HMAC_OLD(-133),
+#         KRB5_ENCTYPE_ARCFOUR_HMAC_OLD_EXP(-135),
+# -- these are for Heimdal internal use
+#         KRB5_ENCTYPE_DES_CBC_NONE(-0x1000),
+#         KRB5_ENCTYPE_DES3_CBC_NONE(-0x1001),
+#         KRB5_ENCTYPE_DES_CFB64_NONE(-0x1002),
+#         KRB5_ENCTYPE_DES_PCBC_NONE(-0x1003),
+#         KRB5_ENCTYPE_DIGEST_MD5_NONE(-0x1004),          -- private use, lukeh@padl.com
+#         KRB5_ENCTYPE_CRAM_MD5_NONE(-0x1005)             -- private use, lukeh@padl.com
+# }
+
+my %defined_enctypes = (
+        0 => 'KRB5_ENCTYPE_NULL',
+        1 => 'KRB5_ENCTYPE_DES_CBC_CRC',
+        2 => 'KRB5_ENCTYPE_DES_CBC_MD4',
+        3 => 'KRB5_ENCTYPE_DES_CBC_MD5',
+        5 => 'KRB5_ENCTYPE_DES3_CBC_MD5',
+        7 => 'KRB5_ENCTYPE_OLD_DES3_CBC_SHA1',
+        8 => 'KRB5_ENCTYPE_SIGN_DSA_GENERATE',
+        9 => 'KRB5_ENCTYPE_ENCRYPT_RSA_PRIV',
+        10 => 'KRB5_ENCTYPE_ENCRYPT_RSA_PUB',
+        16 => 'KRB5_ENCTYPE_DES3_CBC_SHA1',
+        17 => 'KRB5_ENCTYPE_AES128_CTS_HMAC_SHA1_96',
+        18 => 'KRB5_ENCTYPE_AES256_CTS_HMAC_SHA1_96',
+        23 => 'KRB5_ENCTYPE_ARCFOUR_HMAC_MD5',
+        24 => 'KRB5_ENCTYPE_ARCFOUR_HMAC_MD5_56',
+        48 => 'KRB5_ENCTYPE_ENCTYPE_PK_CROSS',
+);
+
+# heimdal/lib/hdb.asn1$
+# HDBFlags ::= BIT STRING {$
+#         initial(0),                     -- require as-req$
+#         forwardable(1),                 -- may issue forwardable$
+#         proxiable(2),                   -- may issue proxiable$
+#         renewable(3),                   -- may issue renewable$
+#         postdate(4),                    -- may issue postdatable$
+#         server(5),                      -- may be server$
+#         client(6),                      -- may be client$
+#         invalid(7),                     -- entry is invalid$
+#         require-preauth(8),             -- must use preauth$
+#         change-pw(9),                   -- change password service$
+#         require-hwauth(10),             -- must use hwauth$
+#         ok-as-delegate(11),             -- as in TicketFlags$
+#         user-to-user(12),               -- may use user-to-user auth$
+#         immutable(13),                  -- may not be deleted$
+#         trusted-for-delegation(14),     -- Trusted to print forwardabled tickets$
+#         allow-kerberos4(15),            -- Allow Kerberos 4 requests$
+#         allow-digest(16),               -- Allow digest requests$
+#         locked-out(17),                 -- Account is locked out,$
+#                                         -- authentication will be denied$
+#         require-pwchange(18),           -- require a passwd change$
+#         do-not-store(31)                -- Not to be modified and stored in HDB$
+# }$
+
+my %defined_flags = (
+        initial                => 2**0,
+        forwardable            => 2**1,
+        proxiable              => 2**2,
+        renewable              => 2**3,
+        postdate               => 2**4,
+        server                 => 2**5,
+        client                 => 2**6,
+        invalid                => 2**7,
+        require_preauth        => 2**8,
+        change_pw              => 2**9,
+        require_hwauth         => 2**10,
+        ok_as_delegate         => 2**11,
+        user_to_user           => 2**12,
+        immutable              => 2**13,
+        trusted_for_delegation => 2**14,
+        allow_kerberos4        => 2**15,
+        allow_digest           => 2**16,
+        locked_out             => 2**17,
+        require_pwchange       => 2**18,
+        do_not_store           => 2**31,
+);
+
+# Record the starting time of the script.
+my $current_time = time;
+
+# Keep track of number of parsed entries.
+my $num_entries = 0;
+
+# Keep track of number of expired principals.
+my $num_expired_principals = 0;
+
+# Keep track of number of principals that will expire in the future.
+my $num_future_expire_principals = 0;
+
+# Keep track of number of principals with expired passwords.
+my $num_expired_passwords = 0;
+
+# Keep track of number of principals with passwords that will expire in the future.
+my $num_future_expire_passwords = 0;
+
+# Know if we found the flag we were looking for with --find-flag.
+my $find_flag_found = 0;
+
+# Know if we found principals with password expire set.
+my $password_expire_found = 0;
+
+# Know if we found principals with expire set.
+my $principal_expire_found = 0;
+
+# If we only have one argument, set a default mode. Hopefully the only
+# argument is a dump file, but if it is not, the script will correctly die at
+# the "$#ARGV == -1" check after GetOptions() anyway.
+my $default_mode = 0;
+if ($#ARGV == 0) {
+    $default_mode = 1;
+}
+
+# Set defaults for available options
+my $man = 0;
+my $help = 0;
+my $enctype_mode = 0;
+my $list_des = 0;
+my $list_des3 = 0;
+my $list_rc4 = 0;
+my $list_aes = 0;
+my $flag_mode = 0;
+my $summary_mode = 0;
+my $find_flag_mode = '';
+my $passwdend_mode = 0;
+my $validend_mode = 0;
+my $valid_mode = 0;
+my $invalid_mode = 0;
+my $debug_mode = 0;
+my $expire_per_month_mode = 0;
+my $expire_diff_mode = 0;
+
+GetOptions('help|?' => \$help,
+           man => \$man,
+           enctypes => \$enctype_mode,
+           'list-des' => \$list_des,
+           'list-des3' => \$list_des3,
+           'list-rc4' => \$list_rc4,
+           'list-aes' => \$list_aes,
+           summary => \$summary_mode,
+           passwdend => \$passwdend_mode,
+           validend => \$validend_mode,
+           valid => \$valid_mode,
+           invalid => \$invalid_mode,
+           debug => \$debug_mode,
+           'expire-per-month' => \$expire_per_month_mode,
+           'expire-diff' => \$expire_diff_mode,
+           'find-flag=s' => \$find_flag_mode,
+           flags => \$flag_mode)
+or pod2usage(2);
+
+pod2usage(1) if $help;
+pod2usage(-exitval => 0, -verbose => 2) if $man;
+
+# Show usage if no input file is given
+pod2usage(1) if $#ARGV == -1;
+
+my %expire_list;
+
+sub handle_timestamp{
+    my $princ = $_[0];
+    my $stamptype = $_[1];
+    my $timestamp = $_[2];
+
+    my $year;
+    my $mon;
+    my $mday;
+    my $hour;
+    my $min;
+    my $sec;
+
+    if($timestamp =~ /^(?<year>\d\d\d\d)(?<mon>\d\d)(?<mday>\d\d)(?<hour>\d\d)(?<min>\d\d)(?<sec>\d\d)$/){
+        $year = $+{year};
+        # See perldoc -f localtime for "- 1":
+        $mon  = $+{mon} - 1;
+        $mday = $+{mday};
+        $hour = $+{hour};
+        $min  = $+{min};
+        $sec  = $+{sec};
+    }
+    elsif ($timestamp =~ /^-$/){
+        # The timestamp is unset, do not store
+        return 0;
+    }
+    else {
+        # Something is wrong
+        print "timestamp is broken, exiting: $timestamp\n";
+        exit 1
+    }
+
+    # Do $mon+1 since this is supposed to be human readable.
+    # (See perldoc -f localtime).
+    my $pretty_month = sprintf("%02d",$mon + 1);
+
+    my $expire_time = timegm( $sec, $min, $hour, $mday, $mon, $year );
+
+    if ($expire_time < $current_time){
+
+        # Add hash for sorting principals by year+month.
+        $expire_list{$stamptype}{"expired"}{$year}{$pretty_month}{$princ} = 1;
+
+        if ($stamptype eq "validend") {
+            $num_expired_principals++;
+        }
+        if ($stamptype eq "passwdend") {
+            $num_expired_passwords++;
+        }
+        # This principal has expired, store it if $invalid_mode is set
+        if ($invalid_mode){
+            return 1;
+        }
+    }
+    if ($expire_time > $current_time){
+        
+        # See above for comment
+        $expire_list{$stamptype}{"valid"}{$year}{$pretty_month}{$princ} = 1;
+
+        if ($stamptype eq "validend") {
+            $num_future_expire_principals++;
+        }
+        if ($stamptype eq "passwdend") {
+            $num_future_expire_passwords++;
+        }
+        # This principal is still valid, store it if $valid_mode is set
+        if ($valid_mode){
+            return 1;
+        }
+    }
+
+    # If neither $valid_mode or $invalid_mode is set, we want to store all records.
+    if (! ($valid_mode or $invalid_mode)){
+        return 1;
+    }
+
+    # If we reach this point we do not want to store the record
+    return 0;
+}
+
+sub get_diff{
+    my $password_expire = $_[0];
+    my $modification_date = $_[1];
+
+    my $year;
+    my $mon;
+    my $mday;
+    my $hour;
+    my $min;
+    my $sec;
+
+    if($password_expire =~ /^(?<year>\d\d\d\d)(?<mon>\d\d)(?<mday>\d\d)(?<hour>\d\d)(?<min>\d\d)(?<sec>\d\d)$/){
+        $year = $+{year};
+        # See perldoc -f localtime for "- 1":
+        $mon  = $+{mon} - 1;
+        $mday = $+{mday};
+        $hour = $+{hour};
+        $min  = $+{min};
+        $sec  = $+{sec};
+    }
+    else {
+        # Something is wrong
+        print "password_expire timestamp is broken, exiting: $password_expire\n";
+        exit 1
+    }
+
+    my $password_expire_time = timegm( $sec, $min, $hour, $mday, $mon, $year );
+
+    if($modification_date =~ /^(?<year>\d\d\d\d)(?<mon>\d\d)(?<mday>\d\d)(?<hour>\d\d)(?<min>\d\d)(?<sec>\d\d)$/){
+        $year = $+{year};
+        # See perldoc -f localtime for "- 1":
+        $mon  = $+{mon} - 1;
+        $mday = $+{mday};
+        $hour = $+{hour};
+        $min  = $+{min};
+        $sec  = $+{sec};
+    }
+    else {
+        # Something is wrong
+        print "modification_date timestamp is broken, exiting: $modification_date\n";
+        exit 1
+    }
+
+    my $modification_expire_time = timegm( $sec, $min, $hour, $mday, $mon, $year );
+
+    my $time_diff = $password_expire_time - $modification_expire_time;
+
+    return $time_diff;
+}
+
+# The hash that holds the parsed entries keyed by uid@REALM.
+my %entries;
+
+# Variables that store the global enctype contents
+my %used_enctypes = ();
+my %des_principals = ();
+my %des3_principals = ();
+my %rc4_principals = ();
+my %aes_principals = ();
+
+# Loop over every line in the supplied database dump and fill in the %entries
+# hash.
+while(<>){
+    # Make sure the dump_regex matches
+    if ($_ =~ $dump_regex){
+
+        $num_entries++;
+
+        my $keys = $+{keys};
+        my $princ = $+{princ};
+        my $flags = $+{flags};
+        my $passwdend = $+{passwdend};
+        my $validend = $+{validend};
+        my $moddate = $+{moddate};
+
+        # Stop if we find more than one entry for a principal
+        if ($entries{$princ}){
+            print "principal \"$princ\" found twice, exiting\n";
+            exit 1;
+        }
+
+        # Define an empty hash for the principal.
+        $entries{$princ} = {};
+
+        ### Store encryption types
+
+        my $matched_keys = 0;
+
+        # Perform a global (/g) match and loop over every enctype on the line
+        while ($keys =~ /(?<mkvno>\d+):(?<enctype>\d+):(?<keyvalue>\w+):(?<salt>[^:]+):?/g) {
+            # We want to know if the regex matches at all since we are dealing
+            # with something strange otherwise
+            $matched_keys = 1;
+            my $enctype = $+{enctype};
+
+            # Keep a count of the used encryption types (some are counted more
+            # then once because of multiple salts)
+            if (! $used_enctypes{$enctype}){
+                $used_enctypes{$enctype} = 1;
+
+                # Store the encryption type by name rather than by numeric id for
+                # easy reference.
+                $entries{$princ}{"enctypes"}{$defined_enctypes{$enctype}} = 1;
+            }
+            else {
+                $used_enctypes{$enctype}++;
+                $entries{$princ}{"enctypes"}{$defined_enctypes{$enctype}}++;
+            }
+
+            # Keep track of users with specific enctypes
+            if ($defined_enctypes{$enctype} =~ /KRB5_ENCTYPE_DES_/){
+               $des_principals{$princ} = 1; 
+            }
+            if ($defined_enctypes{$enctype} =~ /KRB5_ENCTYPE_DES3_/){
+               $des3_principals{$princ} = 1; 
+            }
+            if ($defined_enctypes{$enctype} =~ /KRB5_ENCTYPE_ARCFOUR_/){
+               $rc4_principals{$princ} = 1; 
+            }
+            if ($defined_enctypes{$enctype} =~ /KRB5_ENCTYPE_AES\d+_CTS_HMAC_SHA1_96/){
+               $aes_principals{$princ} = 1; 
+            }
+        }
+
+        if (! $matched_keys){
+            print "unable to match keys: $keys\n";
+            exit 1;
+        }
+
+        ### Store flags
+
+        foreach my $flag (keys %defined_flags){
+            if ($flags & $defined_flags{$flag}){
+                $entries{$princ}{"flags"}{$flag} = 1;
+            }
+        }
+
+        ### Store specific flag if we are looking for one
+
+        if ($find_flag_mode) {
+            if ($defined_flags{$find_flag_mode}) {
+                foreach my $flag (keys %defined_flags){
+                    if ($flags & $defined_flags{$find_flag_mode}){
+                        $find_flag_found = 1;
+                        $entries{$princ}{"find_flag"}{$find_flag_mode} = 1;
+                    }
+                }
+            }
+            else {
+                print "The flag \"$find_flag_mode\" is not defined, exiting\n";
+                exit 1;
+            }
+        }
+
+        ### Store validend (principal expire time) if set
+
+        if (handle_timestamp($princ, "validend", $validend)){
+            $principal_expire_found = 1;
+            $entries{$princ}{"validend"}{$validend} = 1;
+        }
+
+        ### Store passwdend (password expire time) if set
+
+        if (handle_timestamp($princ, "passwdend", $passwdend)){
+            $password_expire_found = 1;
+            $entries{$princ}{"passwdend"}{$passwdend} = 1;
+        }
+
+        ### Store moddate (modification date) if set
+        if ($moddate){
+            $entries{$princ}{"moddate"}{$moddate} = 1;
+        }
+
+    }
+    # If $dump_regex does not match, something is very wrong.
+    else {
+        print "unable to parse entry: $_";
+        exit 1;
+    }
+}
+
+#
+# Present data
+#
+
+if ($default_mode){
+    foreach my $princ (sort keys %entries){
+        print "$princ\n";
+    }
+}
+
+if ($expire_diff_mode){
+    my $passwdend_time = 0;
+    my $moddate_time = 0;
+
+    foreach my $princ (sort keys %entries){
+        if ($entries{$princ}{"passwdend"} and $entries{$princ}{"moddate"}){
+                foreach my $passwdend (sort keys %{$entries{$princ}{"passwdend"}}){
+                    $passwdend_time = $passwdend;
+                }
+                foreach my $moddate (sort keys %{$entries{$princ}{"moddate"}}){
+                    $moddate_time = $moddate;
+                }
+                my $diff = get_diff($passwdend_time, $moddate_time);
+
+                print "$princ diff: $diff\n";
+        }
+    }
+}
+
+
+if ($enctype_mode){
+    print "Encryption type usage:\n";
+    foreach my $used_enctype (sort keys %used_enctypes) {
+        print "$defined_enctypes{$used_enctype}: $used_enctypes{$used_enctype}\n";
+    }
+    print "\n";
+}
+
+if($list_des){ 
+    if (%des_principals){
+        print "Principals with DES encryption types:\n";
+        foreach my $des_princ (sort keys %des_principals) {
+            print "$des_princ\n";
+        }
+        print "\n";
+    }
+}
+
+if($list_des3){ 
+    if (%des3_principals){
+        print "Principals with DES3 encryption types:\n";
+        foreach my $des3_princ (sort keys %des3_principals) {
+            print "$des3_princ\n";
+        }
+        print "\n";
+    }
+}
+
+if($list_rc4){ 
+    if (%rc4_principals){
+        print "Principals with RC4 encryption types:\n";
+        foreach my $rc4_princ (sort keys %rc4_principals) {
+            print "$rc4_princ\n";
+        }
+        print "\n";
+    }
+}
+
+if($list_aes){ 
+    if (%aes_principals){
+        print "Principals with AES encryption types:\n";
+        foreach my $aes_princ (sort keys %aes_principals) {
+            print "$aes_princ\n";
+        }
+        print "\n";
+    }
+}
+
+if ($flag_mode){
+    print "Principal flags:\n";
+    foreach my $princ (sort keys %entries){
+        print "$princ:\n";
+        foreach my $flag (sort keys %{$entries{$princ}{"flags"}}){
+            print "    $flag\n";
+        }
+    }
+    print "\n";
+}
+
+if ($find_flag_mode){
+    if($find_flag_found){
+        print "Principals with \"$find_flag_mode\" flag:\n";
+        foreach my $princ (sort keys %entries){
+            if($entries{$princ}{"find_flag"}{$find_flag_mode}){
+                print "$princ\n";
+            }
+        }
+        print "\n";
+    }
+}
+
+if ($passwdend_mode){
+    if ($password_expire_found){
+        print "Principals with password expiry set:\n";
+        foreach my $princ (sort keys %entries){
+            foreach my $passwdend (sort keys %{$entries{$princ}{"passwdend"}}){
+                if ($passwdend !~ /^-$/){
+                    print "$princ: $passwdend\n";
+                }
+
+            }
+        }
+        print "\n";
+    }
+}
+
+if ($validend_mode){
+    if ($principal_expire_found){
+        print "Principals with principal expiry set:\n";
+        foreach my $princ (sort keys %entries){
+            foreach my $validend (sort keys %{$entries{$princ}{"validend"}}){
+                if ($validend !~ /^-$/){
+                    print "$princ: $validend\n";
+                }
+            }
+        }
+        print "\n";
+    }
+
+}
+
+if ($expire_per_month_mode){
+    foreach my $expire_type (sort keys %expire_list){
+
+        foreach my $validity (sort keys %{$expire_list{$expire_type}}){
+            if($valid_mode and $validity eq "expired"){
+                next;
+            }
+
+            if($invalid_mode and $validity eq "valid"){
+                next;
+            }
+
+            print "type: $expire_type\n";
+
+            foreach my $year (sort keys %{$expire_list{$expire_type}{$validity}}){
+                foreach my $month (sort keys %{$expire_list{$expire_type}{$validity}{$year}}){
+                    foreach my $princ (sort keys %{$expire_list{$expire_type}{$validity}{$year}{$month}}){
+                        print "    $validity $year-$month: $princ\n";
+                    }
+                }
+            }
+        }
+    # Print a newline after a $type is done
+    print "\n"
+    }
+}
+
+print Dumper \%entries if $debug_mode;
+print Dumper \%expire_list if $debug_mode;
+
+if ($summary_mode){
+
+    my $num_all_expire_principals = $num_expired_principals + $num_future_expire_principals;
+    my $num_all_expire_passwords = $num_expired_passwords + $num_future_expire_passwords;
+
+    my $num_host_principals = 0;
+    my $num_root_principals = 0;
+    my $num_admin_principals = 0;
+
+    foreach my $princ (sort keys %entries){
+        if($princ =~ m,^host/,){
+            $num_host_principals++;
+        }
+        if($princ =~ m,/root@,){
+            $num_root_principals++;
+        }
+        if($princ =~ m,/admin@,){
+            $num_admin_principals++;
+        }
+    }
+
+    print "Total number of entries: $num_entries\n";
+    print "\n";
+
+    print "Number of host principals: $num_host_principals\n";
+    print "Number of root principals: $num_root_principals\n";
+    print "Number of admin principals: $num_admin_principals\n";
+    print "\n";
+
+    print "Total number of principals with expiry set: $num_all_expire_principals\n";
+    print "Expired: $num_expired_principals\n";
+    print "Valid: $num_future_expire_principals\n";
+    print "\n";
+
+    print "Total number of principals with password expiry set: $num_all_expire_passwords\n";
+    print "Expired: $num_expired_passwords\n";
+    print "Valid: $num_future_expire_passwords\n";
+    print "\n";
+}
+
+__END__
+
+=head1 NAME
+
+hdumpstat - parse a Heimdal database dump
+
+=head1 SYNOPSIS
+
+hdumpstat [options] <heimdal database dump>
+
+=head1 DESCRIPTION
+
+B<hdumpstat> will parse information from a Heimdal database
+dump (http://h5l.org/).
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-help>
+
+Print a brief help message and exits.
+
+=item B<-man>
+
+Prints the manual page and exits.
+
+=item B<-enctypes>
+
+Prints summary information about encryption types in use.
+
+=item B<-list-des>
+
+List principals with DES encryption types.
+
+=item B<-list-des3>
+
+List principals with DES3 encryption types.
+
+=item B<-list-rc4>
+
+List principals with RC4 encryption types.
+
+=item B<-list-aes>
+
+List principals with AES encryption types.
+
+=item B<-flags>
+
+Lists all flags set on each principal in the dump, note that these are not necessarily the same flags as are seen with a kadmin 'get'.
+
+=item B<-find-flag>
+
+Print principals with the specified flag set.
+
+=item B<-passwdend>
+
+Lists principals with a password expiry set.
+
+=item B<-validend>
+
+Lists principals with a principal expiry set.
+
+=item B<-valid>
+
+Used together with -passwdend or -validend to only list principals that have not expired.
+
+=item B<-invalid>
+
+Used together with -passwdend or -validend to only list principals that have expired.
+
+=item B<-summary>
+
+Prints a summary of the database dump.
+
+=item B<-expire-per-month>
+
+Prints a summary expired principals and accounts. Can be used together with -valid and -invalid.
+
+=item B<-debug>
+
+Print debug information.
+
+=back
+
+=head1 EXAMPLES
+
+$ hdumpstat --summary ./hdb-dump
+
+$ hdumpstat --passwdend ./hdb-dump
+
+$ hdumpstat --passwdend --valid ./hdb-dump
+
+$ hdumpstat --passwdend --invalid ./hdb-dump
+
+$ hdumpstat --find-flag require_preauth ./hdb-dump
+
+=head1 AUTHORS
+
+Patrik Lundin <patrik.lundin.swe@gmail.com>
+=cut
